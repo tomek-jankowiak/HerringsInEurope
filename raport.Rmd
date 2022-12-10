@@ -1,0 +1,187 @@
+---
+title: "Analiza przyczyn karłowacenia śledzi oceanicznych wyławianych w Europie"
+author: "Tomasz Jankowiak"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Poniższy raport przedstawia analizę danych dotyczących połowów śledzi oceanicznych w Europie na przestrzeni ostatnich kilkudziesięciu lat, w których zaobserwowany został spadek ich rozmiaru. Posiadając informacje, m.in. o występowaniu wybranych gatunków planktonu, wielkości i natężeniu połowów czy warunkach środowiska, udało się przeanalizować wpływ poszczegołnych atrybutów na długość śledzia oraz wyznaczyć model regresji, który na podstawie najsilniej skorelowanych własności jest w stanie przewidzieć rozmiar tych ryb. W wyniku przeprowadzonych badań udało się dojść do wniosku, że najbardziej na śledzie wpływają:
+
+* natężenie połowów w regionie (*fbar*), 
+* dostępność planktonu (zagęszczenie widłonogów gat. 1, *lcop1*),
+* temperatura powierzchni wody (*sst*),
+
+gdzie ta ostatnia charakterystyka okazała się mieć największy wpływ. 
+
+## Biblioteki R
+
+```{r libraries, warning=FALSE, message=FALSE}
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(plotly)
+library(reshape2)
+library(corrplot)
+library(caret)
+set.seed(23)
+```
+
+## Wczytanie danych
+
+```{r data, cache=TRUE}
+herrings_raw <- read.csv('sledzie.csv', na.strings = "?")
+```
+
+## Dostosowanie zbioru danych
+
+Na zbiorze danych zostały przeprowadzone operacje wyznaczenia roku poszczególnych wpisów oraz wyczyszczenia danych pustych.
+Rok wyznaczono na podstawie atrybutu opisującego roczny narobek (*recr*). Założono, że dla kolejnych lat wartość ta jest unikalna, a poszczególne jej wartości występują w zbiorze w porządku chronologicznym - od najstarszego do najmłodszego połowu. W ten sposób uzyskano 52 unikalne lata połowów śledzi.
+Wartości puste natomiast obliczone zostały jako wartość średnia atrybutu w danym roku połowu.
+
+```{r data_adjustment_and_cleanup, cache=TRUE}
+ordered_recr = c()
+years_in_order = c()
+
+for (i in 1:nrow(herrings_raw)) {
+  data_row <- herrings_raw[i,]
+  if (data_row$recr %in% ordered_recr) {
+    years_in_order <- append(years_in_order, which(ordered_recr == data_row$recr))
+  } else {
+    ordered_recr <- append(ordered_recr, data_row$recr)
+    years_in_order <- append(years_in_order, length(ordered_recr))
+  }
+}
+
+herrings <- herrings_raw %>%
+              select(-X) %>%
+              add_column(year = years_in_order) %>% 
+              group_by(year) %>%
+              mutate_at(vars(-group_cols()), list(~ ifelse(is.na(.), mean(., na.rm=TRUE), .))) %>%
+              ungroup()
+```
+
+## Podsumowanie zbioru i analiza wartości atrybutów
+
+Analizowany zbiór składa się z `r nrow(herrings)` wierszy oraz `r ncol(herrings)` atrybutów.
+Rozkład poszczególnych atrybutów prezentuje się następująco:
+
+```{r sumarry}
+knitr::kable(summary(herrings[,1:8]))
+knitr::kable(summary(herrings[,9:16]))
+```
+
+```{r histograms, message=FALSE, fig.height=10}
+attributes <- herrings %>% select(-c(xmonth, year)) %>% melt()
+ggplot(attributes, aes(x = value)) + 
+  facet_wrap(~variable, scales="free", ncol = 3) +
+  geom_histogram() + 
+  theme_bw()
+```
+
+## Korelacja między atrybutami
+```{r correlation, fig.width=15, fig.height=15}
+attributes_correlation <- herrings %>% select(-year) %>% cor() %>% round(2)
+corrplot(attributes_correlation, 
+         method = 'color',
+         type = 'lower',
+         diag = FALSE,
+         order = 'hclust',
+         addCoef.col = 'black',
+         tl.cex = 2)
+```
+Na podstawie wykresu korelacji między własnościami charakteryzującymi połów śledzi udało się wyznaczyć 5 z nich, które najsilniej korelują z długością:
+
+* fbar 0.25,
+* lcop1 0.24,
+* chel1 0.22 
+* sst -0.45,
+* nao -0.26,
+
+Jednak chel1 odrzucono, ponieważ koreluje on silnie z lcop1. 
+
+## Rozmiar śledzi w czasie
+
+```{r length_over_time}
+avg_length_by_year <- herrings %>% 
+  select(length, year) %>%
+  group_by(year) %>% 
+  summarize(avg_length = mean(length))
+
+length_plot <- ggplot(avg_length_by_year, aes(x = year)) + 
+  geom_point(aes(y = avg_length, color = 'średnia długość')) +
+  layer(
+    data = herrings, 
+    mapping = aes(x = year, y = length, color = 'trend'), 
+    stat='smooth', 
+    params=list(
+      method='glm',
+      formula= y~poly(x,2)),
+    geom = 'smooth',
+    position = position_identity()) + 
+  scale_color_manual(name = '', values = c('black', 'blue')) +
+  labs(x = 'Rok', y = 'Długość śledzia') +
+  theme_bw()
+ggplotly(length_plot)
+```
+
+## Przewidywanie rozmiaru śledzia
+
+W celu znalezienia modelu regresji do przewidywania długości śledzia oceanicznego użyto dwóch metod oraz atrybutów wyznaczonych wcześniej przy użyciu wykresu korelacji.
+
+### Regresja liniowa:
+```{r prediction_linear_regression}
+training_idx <- createDataPartition(y = herrings$length, p = 0.8, list = F)
+herrings_training <- herrings[training_idx, ]
+herrings_testing <- herrings[-training_idx, ]
+
+ctrl <- trainControl(method = 'repeatedcv', number = 2, repeats = 5)
+linear_regression_model <- train(length ~ fbar + lcop1 + sst + nao,
+                                 data = herrings_training,
+                                 method = 'lm',
+                                 trControl = ctrl,
+                                 preProc = c('center', 'scale'))
+linear_regression_prediction <- predict(linear_regression_model, newdata = herrings_testing)
+print(linear_regression_model)
+linear_regression_rmse <- sqrt(sum((linear_regression_prediction - herrings_testing$length)^2) / length(herrings_testing$length))
+linear_regression_rsquared <- cor(linear_regression_prediction, herrings_testing$length) ^ 2
+```
+
+* RMSE: `r linear_regression_rmse`
+* R^2: `r linear_regression_rsquared`
+
+### Random forest  
+```{r prediction_random_forest, warning=FALSE}
+#rfGrid <- expand.grid(mtry = 5:30)
+rfGrid <- expand.grid(mtry = 18)
+random_forest_model <- train(length ~ fbar + lcop1 + sst + nao,
+                             data = herrings_training,
+                             method = 'rf',
+                             trControl = ctrl,
+                             preProc = c('center', 'scale'),
+                             tuneGrid = rfGrid, 
+                             ntree = 100)
+random_forest_prediction <- predict(random_forest_model, newdata = herrings_testing)
+print(random_forest_model)
+random_forest_rmse <- sqrt(sum((random_forest_prediction - herrings_testing$length)^2) / length(herrings_testing$length))
+random_forest_rsuqred <- cor(random_forest_prediction, herrings_testing$length) ^ 2
+```
+
+* RMSE: `r random_forest_rmse`
+* R^2: `r random_forest_rsuqred`
+
+## Analiza znalezionego modelu regresji
+```{r var_imp}
+ggplot(varImp(random_forest_model, scale = F)) + 
+  labs(x = 'Atrybut', y = 'Ważność') + 
+  theme_bw()
+```
+
+Okzauje się, że największy wpływ na długość śledzia oceanicznego wyławianego w Europie ma temperatura powierzchni wody. Znaczenie ma również natężenie połowów w poszczególnych regionach oraz dostępność planktonu. Stopniowo rosnąca temperatura wody, spowodowana na przykład działalnością człowieka, czy efektem cieplarnianym i coraz gęstsze połowy, wynikające z rosnącego popytu na wszelkie produkty rybne, niestety wpływają negatywnie na te stworzenia i przyczyniają się do zmniejszania ich rozmiaru. 
